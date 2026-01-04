@@ -1,15 +1,16 @@
 """
-Gabagool Strategy: Skew-based inventory rebalancing with loss-bounded hedging.
+Gabagool Strategy: Continuous delta-neutral hedging.
 
-Key principles:
-1. Enter when market is skewed (one side very cheap, other expensive)
-2. Buy cheap side first (13-20¢ range)
-3. Hedge with expensive side (up to 85¢) to cap risk
-4. Accept pair_cost near 1.0 (loss-bounded, not guaranteed profit)
+Based on analysis of gabagool22's trading patterns:
+1. Buy BOTH sides of every market continuously
+2. Target pair_cost near $1.00 (accept breakeven or small loss)
+3. Small order sizes (~15 shares)
+4. High frequency - trade on every price update
+5. No skew requirements - just accumulate both sides
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import config
 from position_tracker import MarketPosition
@@ -22,22 +23,24 @@ class TradeSignal:
     price: float
     quantity: float
     reason: str
-    urgency: str = "normal"  # normal, eager, urgent, emergency
+    urgency: str = "normal"
 
 
 class GabagoolStrategy:
     """
-    Skew-based inventory rebalancing strategy.
+    Continuous hedging strategy - buy both sides to create delta-neutral positions.
 
-    Entry: When |UP - DOWN| > 0.60 and min(UP, DOWN) < 0.20
-    Hedge: Buy other side up to 0.85 if it reduces unhedged exposure
-    Goal: Keep pair_cost <= urgency threshold (0.995 to 1.02)
+    Logic:
+    1. If no position: buy the cheaper side
+    2. If one side only: buy the other side to hedge
+    3. If both sides: buy whichever improves balance or pair_cost
+    4. Always check that simulated pair_cost <= max for urgency level
     """
 
     def __init__(
         self,
         min_shares_per_order: float = 5.0,
-        max_shares_per_order: float = 50.0,
+        max_shares_per_order: float = 15.0,
     ):
         self.min_shares_per_order = min_shares_per_order
         self.max_shares_per_order = max_shares_per_order
@@ -59,6 +62,10 @@ class GabagoolStrategy:
             urgency, config.URGENCY_THRESHOLDS["normal"]
         )["max_pair_cost"]
 
+    def _is_valid_price(self, price: float) -> bool:
+        """Check if price is within acceptable range."""
+        return config.MIN_BUY_PRICE <= price <= config.MAX_BUY_PRICE
+
     def _simulate_pair_cost(
         self,
         position: MarketPosition,
@@ -78,9 +85,9 @@ class GabagoolStrategy:
             new_avg_no = new_cost_no / new_qty_no if new_qty_no > 0 else price
             new_avg_yes = position.avg_yes
 
-        # If one side has no position, can't calculate pair cost yet
+        # If one side has no position, estimate with current price
         if new_avg_yes == 0 or new_avg_no == 0:
-            return price  # Return just this side's price as estimate
+            return price  # Can't calculate full pair cost yet
 
         return new_avg_yes + new_avg_no
 
@@ -94,193 +101,194 @@ class GabagoolStrategy:
         """
         Evaluate current prices and position to determine if we should trade.
 
-        Logic:
-        1. No position: Enter if skew > 0.60 and cheap side < 0.20
-        2. One side: Hedge if simulated pair_cost <= max for urgency
-        3. Both sides: Add more if it improves pair_cost
+        Gabagool style: Always try to buy both sides, keep positions balanced.
         """
-        has_yes = position.qty_yes > 0
-        has_no = position.qty_no > 0
-        urgency = self._get_urgency_level(minutes_remaining)
-
-        # CASE 1: No position yet - check for skew-based entry
-        if not has_yes and not has_no:
-            return self._evaluate_first_leg(up_price, down_price, minutes_remaining)
-
-        # CASE 2: Have one side only - complete the hedge
-        if has_yes and not has_no:
-            return self._evaluate_completing_hedge(
-                position, "NO", down_price, up_price, urgency, minutes_remaining
-            )
-        if has_no and not has_yes:
-            return self._evaluate_completing_hedge(
-                position, "YES", up_price, down_price, urgency, minutes_remaining
-            )
-
-        # CASE 3: Have both sides - add more if it improves pair_cost
-        return self._evaluate_improving_position(position, up_price, down_price, urgency)
-
-    def _evaluate_first_leg(
-        self, up_price: float, down_price: float, minutes_remaining: float
-    ) -> Optional[TradeSignal]:
-        """
-        Enter position when market is skewed.
-
-        Entry conditions:
-        - |UP - DOWN| > ENTRY_MIN_SKEW (0.60)
-        - min(UP, DOWN) < ENTRY_MAX_CHEAP_PRICE (0.20)
-        - minutes_remaining >= MIN_MINUTES_FOR_NEW_POSITION (8)
-        """
-        # Check timing - no new positions late in the window
+        # Don't trade in last minute
         if minutes_remaining < config.MIN_MINUTES_FOR_NEW_POSITION:
             return None
 
-        # Calculate skew
-        skew = abs(up_price - down_price)
-        min_price = min(up_price, down_price)
+        has_yes = position.qty_yes > 0
+        has_no = position.qty_no > 0
+        urgency = self._get_urgency_level(minutes_remaining)
+        max_pair_cost = self._get_max_pair_cost(urgency)
 
-        # Check skew conditions
-        if skew < config.ENTRY_MIN_SKEW:
-            return None  # Market not skewed enough
+        # CASE 1: No position - buy the cheaper side
+        if not has_yes and not has_no:
+            return self._buy_cheaper_side(up_price, down_price, urgency)
 
-        if min_price > config.ENTRY_MAX_CHEAP_PRICE:
-            return None  # Cheap side not cheap enough
+        # CASE 2: Have YES only - buy NO to hedge
+        if has_yes and not has_no:
+            return self._buy_to_hedge(position, "NO", down_price, urgency, max_pair_cost)
 
-        if min_price < config.MIN_BUY_PRICE:
-            return None  # Too illiquid
+        # CASE 3: Have NO only - buy YES to hedge
+        if has_no and not has_yes:
+            return self._buy_to_hedge(position, "YES", up_price, urgency, max_pair_cost)
 
-        # Buy the cheap side
+        # CASE 4: Have both - buy to balance or improve
+        return self._buy_to_balance(position, up_price, down_price, urgency, max_pair_cost)
+
+    def _buy_cheaper_side(
+        self, up_price: float, down_price: float, urgency: str
+    ) -> Optional[TradeSignal]:
+        """Buy the cheaper side to start a position."""
+        # Determine which side is cheaper
         if up_price <= down_price:
             side, price = "YES", up_price
         else:
             side, price = "NO", down_price
 
+        if not self._is_valid_price(price):
+            return None
+
         return TradeSignal(
             side=side,
             price=price,
             quantity=self.max_shares_per_order,
-            reason=f"ENTRY: {side} @ ${price:.2f} (skew={skew:.2f}, {minutes_remaining:.0f}m left)",
-            urgency="normal",
+            reason=f"ENTRY: Buy {side} @ ${price:.3f} (cheaper side)",
+            urgency=urgency,
         )
 
-    def _evaluate_completing_hedge(
+    def _buy_to_hedge(
         self,
         position: MarketPosition,
         side: str,
         price: float,
-        other_price: float,
         urgency: str,
-        minutes_remaining: float,
+        max_pair_cost: float,
     ) -> Optional[TradeSignal]:
-        """
-        Complete the hedge by buying the other side.
+        """Buy the other side to complete the hedge."""
+        if not self._is_valid_price(price):
+            return None
 
-        Allow expensive hedge legs (up to MAX_HEDGE_PRICE = 0.85)
-        as long as simulated pair_cost <= max for urgency level.
-        """
-        # Price bounds
-        if price < config.MIN_BUY_PRICE:
-            return None  # Too illiquid
-        if price > config.MAX_HEDGE_PRICE:
-            return None  # Too expensive even for hedge
-
-        # Get max acceptable pair_cost for this urgency
-        max_pair_cost = self._get_max_pair_cost(urgency)
-
-        # Match quantity to other side for balanced hedge
+        # Match quantity to create balanced position
         other_qty = position.qty_yes if side == "NO" else position.qty_no
         qty = min(other_qty, self.max_shares_per_order)
 
         if qty < self.min_shares_per_order:
-            return None
+            qty = self.min_shares_per_order
 
-        # Simulate the pair_cost after this buy
+        # Simulate pair cost
         simulated_pair_cost = self._simulate_pair_cost(position, side, price, qty)
 
-        if simulated_pair_cost > max_pair_cost:
-            return None  # Would exceed max pair_cost for this urgency
+        # For hedging, be more lenient - we need to complete the hedge
+        if simulated_pair_cost > max_pair_cost + 0.01:  # Allow slightly above max
+            return None
 
-        # Calculate expected P&L per share
-        pnl_per_share = 1.0 - simulated_pair_cost
-
-        # Build reason string
-        if pnl_per_share >= 0:
-            reason = f"[{urgency.upper()}] HEDGE {side} @ ${price:.2f} → pair=${simulated_pair_cost:.3f} (+${pnl_per_share:.3f}/sh)"
-        else:
-            reason = f"[{urgency.upper()}] HEDGE {side} @ ${price:.2f} → pair=${simulated_pair_cost:.3f} ({pnl_per_share:.3f}/sh)"
+        pnl = 1.0 - simulated_pair_cost
+        pnl_str = f"+${pnl:.3f}" if pnl >= 0 else f"-${abs(pnl):.3f}"
 
         return TradeSignal(
             side=side,
             price=price,
             quantity=qty,
-            reason=reason,
+            reason=f"HEDGE: {side} @ ${price:.3f} → pair ${simulated_pair_cost:.3f} ({pnl_str}/sh)",
             urgency=urgency,
         )
 
-    def _evaluate_improving_position(
+    def _buy_to_balance(
         self,
         position: MarketPosition,
         up_price: float,
         down_price: float,
         urgency: str,
-    ) -> Optional[TradeSignal]:
-        """Add to position if it improves pair_cost (already hedged)."""
-        max_pair_cost = self._get_max_pair_cost(urgency)
-
-        # Check if adding YES would improve things
-        yes_signal = self._check_improvement(position, "YES", up_price, max_pair_cost)
-        no_signal = self._check_improvement(position, "NO", down_price, max_pair_cost)
-
-        if yes_signal and no_signal:
-            return yes_signal if yes_signal.price < no_signal.price else no_signal
-        return yes_signal or no_signal
-
-    def _check_improvement(
-        self,
-        position: MarketPosition,
-        side: str,
-        price: float,
         max_pair_cost: float,
     ) -> Optional[TradeSignal]:
-        """Check if adding to this side would improve pair_cost."""
-        our_avg = position.avg_yes if side == "YES" else position.avg_no
+        """Buy to balance position or improve pair_cost."""
+        # Determine which side needs more shares for balance
+        imbalance = position.qty_yes - position.qty_no
 
-        # Only buy if price is better than our current average
-        if price >= our_avg:
+        if abs(imbalance) < self.min_shares_per_order:
+            # Position is balanced - buy whichever is cheaper if it improves pair_cost
+            return self._buy_if_improves(position, up_price, down_price, urgency, max_pair_cost)
+
+        if imbalance > 0:
+            # More YES than NO - buy NO
+            side, price = "NO", down_price
+            qty = min(imbalance, self.max_shares_per_order)
+        else:
+            # More NO than YES - buy YES
+            side, price = "YES", up_price
+            qty = min(abs(imbalance), self.max_shares_per_order)
+
+        if not self._is_valid_price(price):
             return None
 
-        qty = self.min_shares_per_order
-        new_pair_cost = self._simulate_pair_cost(position, side, price, qty)
+        if qty < self.min_shares_per_order:
+            qty = self.min_shares_per_order
 
-        if new_pair_cost >= position.pair_cost:
-            return None  # Wouldn't improve
-        if new_pair_cost > max_pair_cost:
-            return None  # Would exceed threshold
+        # Check pair cost
+        simulated_pair_cost = self._simulate_pair_cost(position, side, price, qty)
+
+        if simulated_pair_cost > max_pair_cost:
+            return None
 
         return TradeSignal(
             side=side,
             price=price,
             quantity=qty,
-            reason=f"IMPROVE: pair ${position.pair_cost:.3f} → ${new_pair_cost:.3f}",
+            reason=f"BALANCE: {side} @ ${price:.3f} (imbalance: {imbalance:.0f})",
+            urgency=urgency,
         )
+
+    def _buy_if_improves(
+        self,
+        position: MarketPosition,
+        up_price: float,
+        down_price: float,
+        urgency: str,
+        max_pair_cost: float,
+    ) -> Optional[TradeSignal]:
+        """Buy if it improves our average (only when balanced)."""
+        # Check if buying YES improves our average
+        yes_signal = None
+        no_signal = None
+
+        if self._is_valid_price(up_price) and up_price < position.avg_yes:
+            new_pair = self._simulate_pair_cost(position, "YES", up_price, self.min_shares_per_order)
+            if new_pair < position.pair_cost and new_pair <= max_pair_cost:
+                yes_signal = TradeSignal(
+                    side="YES",
+                    price=up_price,
+                    quantity=self.min_shares_per_order,
+                    reason=f"IMPROVE: YES @ ${up_price:.3f} (< avg ${position.avg_yes:.3f})",
+                    urgency=urgency,
+                )
+
+        if self._is_valid_price(down_price) and down_price < position.avg_no:
+            new_pair = self._simulate_pair_cost(position, "NO", down_price, self.min_shares_per_order)
+            if new_pair < position.pair_cost and new_pair <= max_pair_cost:
+                no_signal = TradeSignal(
+                    side="NO",
+                    price=down_price,
+                    quantity=self.min_shares_per_order,
+                    reason=f"IMPROVE: NO @ ${down_price:.3f} (< avg ${position.avg_no:.3f})",
+                    urgency=urgency,
+                )
+
+        # Return whichever improves more (lower price = better improvement)
+        if yes_signal and no_signal:
+            return yes_signal if up_price < down_price else no_signal
+        return yes_signal or no_signal
 
     def get_status(self, position: MarketPosition, up_price: float, down_price: float) -> str:
         """Get human-readable strategy status for a position."""
-        skew = abs(up_price - down_price)
-        min_price = min(up_price, down_price)
-
         if not position.qty_yes and not position.qty_no:
-            if skew >= config.ENTRY_MIN_SKEW and min_price <= config.ENTRY_MAX_CHEAP_PRICE:
-                return f"READY - Skew={skew:.2f}, cheap=${min_price:.2f}"
-            return f"WAITING - Skew={skew:.2f} (need >{config.ENTRY_MIN_SKEW:.2f})"
+            cheaper = "YES" if up_price <= down_price else "NO"
+            cheaper_price = min(up_price, down_price)
+            return f"NO POSITION - Will buy {cheaper} @ ${cheaper_price:.3f}"
 
         if not position.is_hedged:
             side = "YES" if position.qty_yes > 0 else "NO"
-            avg = position.avg_yes if position.qty_yes > 0 else position.avg_no
-            return f"UNHEDGED - {side} @ ${avg:.3f}, need other side"
+            other = "NO" if side == "YES" else "YES"
+            other_price = down_price if side == "YES" else up_price
+            return f"UNHEDGED - Have {side}, need {other} @ ${other_price:.3f}"
 
+        imbalance = position.qty_yes - position.qty_no
         pnl = position.expected_pnl
-        if pnl >= 0:
-            return f"HEDGED - pair=${position.pair_cost:.3f}, +${pnl:.2f}"
+        pnl_str = f"+${pnl:.3f}" if pnl >= 0 else f"${pnl:.3f}"
+
+        if abs(imbalance) < 5:
+            return f"HEDGED - pair ${position.pair_cost:.3f}, P&L {pnl_str}/sh"
         else:
-            return f"HEDGED - pair=${position.pair_cost:.3f}, {pnl:.2f}"
+            need = "NO" if imbalance > 0 else "YES"
+            return f"IMBALANCED - need {abs(imbalance):.0f} more {need}"

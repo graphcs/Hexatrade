@@ -35,20 +35,24 @@ TRADING_MODE = "paper"  # "paper" for simulation, "live" for real trading
 PAPER_TRADING_BALANCE = 100.0  # Starting balance for paper trading
 
 # =============================================================================
-# ENTRY CONDITIONS (Skew-Based)
+# ENTRY CONDITIONS (Gabagool Style - Continuous Hedging)
 # =============================================================================
-# Only enter when market is skewed (one side cheaper than other)
-ENTRY_MIN_SKEW = 0.10           # Enter when |UP - DOWN| > 10¢
-ENTRY_MAX_CHEAP_PRICE = 0.50    # Cheap side must be < 50¢ to enter
-MIN_BUY_PRICE = 0.05            # Don't buy if price below this (too illiquid)
+# Buy both sides continuously, don't wait for skew
+MIN_BUY_PRICE = 0.03            # Don't buy below 3¢ (too illiquid)
+MAX_BUY_PRICE = 0.97            # Don't buy above 97¢ (too expensive)
 
 # =============================================================================
-# HEDGE CONDITIONS
+# PAIR COST TARGETING
 # =============================================================================
-# Allow expensive hedge legs to close out risk
-MAX_HEDGE_PRICE = 0.85          # Allow hedge legs up to 85¢
+# Target pair cost near $1.00 - accept breakeven or small loss
+TARGET_PAIR_COST = 1.00         # Target pair cost
+MAX_PAIR_COST = 1.02            # Maximum acceptable pair cost (2% loss max)
+
+# =============================================================================
+# ORDER SIZING (Gabagool uses ~15 shares per order)
+# =============================================================================
 MIN_SHARES_PER_ORDER = 5.0      # Minimum shares per trade
-MAX_SHARES_PER_ORDER = 50.0     # Maximum shares per single order
+MAX_SHARES_PER_ORDER = 15.0     # Keep orders small like Gabagool
 
 # =============================================================================
 # RISK MANAGEMENT
@@ -58,21 +62,19 @@ MAX_PER_MARKET_EXPOSURE = 50.0  # Maximum $ per single market
 MAX_UNHEDGED_MARKETS = 1        # Complete hedge before opening new position
 
 # =============================================================================
-# TIMING
+# TIMING (Gabagool trades continuously, no restrictions)
 # =============================================================================
-# No new first legs after 7 min into window (need 8+ min remaining)
-MIN_MINUTES_FOR_NEW_POSITION = 8
-STOP_TRADING_BEFORE_CLOSE_MINUTES = 0  # Urgency handles late trading
+MIN_MINUTES_FOR_NEW_POSITION = 1    # Trade until last minute
+STOP_TRADING_BEFORE_CLOSE_MINUTES = 0
 
 # =============================================================================
-# URGENCY LEVELS (Operating in 0.995-1.02 range)
+# URGENCY LEVELS (Gabagool accepts pair_cost up to ~1.03)
 # =============================================================================
-# Real trading operates near pair_cost = 1.0, not 0.97
 URGENCY_THRESHOLDS = {
-    "normal": {"minutes": 10, "max_pair_cost": 0.995},   # > 10 min: target small profit
-    "eager": {"minutes": 5, "max_pair_cost": 1.005},     # 5-10 min: accept tiny loss
-    "urgent": {"minutes": 2, "max_pair_cost": 1.01},     # 2-5 min: accept 1% loss
-    "emergency": {"minutes": 0, "max_pair_cost": 1.02},  # < 2 min: accept 2% loss
+    "normal": {"minutes": 10, "max_pair_cost": 1.00},    # > 10 min: target breakeven
+    "eager": {"minutes": 5, "max_pair_cost": 1.01},      # 5-10 min: accept 1% loss
+    "urgent": {"minutes": 2, "max_pair_cost": 1.02},     # 2-5 min: accept 2% loss
+    "emergency": {"minutes": 0, "max_pair_cost": 1.03},  # < 2 min: accept 3% loss
 }
 
 # Wallet (for live trading - not used in paper mode)

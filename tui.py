@@ -125,14 +125,13 @@ class TradingTUI:
         table.add_column("YES", justify="center", width=12)
         table.add_column("NO", justify="center", width=12)
         table.add_column("SUM", justify="center", width=10)
-        table.add_column("SKEW", justify="center", width=8)
-        table.add_column("SIGNAL", justify="center", width=16)
+        table.add_column("ACTION", justify="center", width=16)
 
         with self.price_lock:
             if not self.prices:
                 table.add_row(
                     "[dim]Waiting for data...[/]",
-                    "", "", "", "", ""
+                    "", "", "", ""
                 )
             else:
                 sorted_markets = sorted(
@@ -145,35 +144,31 @@ class TradingTUI:
                     up = data.get("up", 0)
                     down = data.get("down", 0)
                     sum_price = data.get("sum", 0)
-                    skew = abs(up - down)
-                    min_price = min(up, down)
 
-                    # Determine signal based on skew strategy (use config values)
-                    if skew >= config.ENTRY_MIN_SKEW and min_price <= config.ENTRY_MAX_CHEAP_PRICE:
-                        if up <= down:
-                            signal_text = "[bold green]BUY YES[/]"
-                        else:
-                            signal_text = "[bold red]BUY NO[/]"
+                    # Gabagool style: always show which side is cheaper
+                    if up <= down:
+                        action_text = "[bold green]BUY YES[/]"
+                        yes_style = "bold green on dark_green"
+                        no_style = "red"
                     else:
-                        signal_text = "[dim]-[/]"
+                        action_text = "[bold red]BUY NO[/]"
+                        yes_style = "green"
+                        no_style = "bold red on dark_red"
 
-                    # Price styling
+                    # Sum styling based on pair cost potential
                     if sum_price < 0.98:
                         sum_style = "bold green"
                     elif sum_price < 1.02:
                         sum_style = "yellow"
                     else:
-                        sum_style = "dim"
-
-                    skew_style = "bold magenta" if skew >= config.ENTRY_MIN_SKEW else "dim"
+                        sum_style = "red"
 
                     table.add_row(
                         name,
-                        Text(f"${up:.4f}", style="bold green"),
-                        Text(f"${down:.4f}", style="bold red"),
+                        Text(f"${up:.4f}", style=yes_style),
+                        Text(f"${down:.4f}", style=no_style),
                         Text(f"${sum_price:.4f}", style=sum_style),
-                        Text(f"${skew:.2f}", style=skew_style),
-                        signal_text,
+                        action_text,
                     )
 
         return Panel(
