@@ -149,6 +149,3 @@ hexatrade/
 - `requests` - HTTP client
 - `python-dotenv` - Environment variable loading
 
-## License
-
-MIT
